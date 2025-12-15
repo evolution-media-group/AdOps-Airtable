@@ -1,9 +1,10 @@
 # Comment Submission Workflow Pattern
 ## Bypassing Native Airtable Comment Limitations
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Created:** 2025-12-15
-**Purpose:** Enable automation triggers and external API integration for Airtable comments
+**Updated:** 2025-12-15
+**Purpose:** Enable automation triggers, threading, and external API integration for Airtable comments
 
 **Source:** AdOps-Airtable pattern library
 **Related:** [Logger Implementation](Logger_Implementation.md)
@@ -540,13 +541,476 @@ try {
 |---------|-----------------|------------|
 | Triggers automation | ❌ No | ✅ Yes |
 | Real-time | ✅ Yes | ✅ Yes |
-| Threading | ✅ Yes | ❌ No (flat) |
-| Reactions | ✅ Yes | ❌ No |
+| Threading | ✅ Yes | ✅ Yes (with enhancement) |
+| Reactions | ✅ Yes | ⚠️ Custom only |
 | @mentions | ✅ Yes | ⚠️ Manual |
 | Searchable | ❌ Limited | ✅ Full |
 | External API | ❌ Polling only | ✅ Direct |
 | Audit trail | ❌ No | ✅ Yes |
-| Analytics | ❌ Yes | ✅ Yes |
+| Analytics | ❌ No | ✅ Yes |
+
+---
+
+## Threading Support
+
+The Airtable Comments API supports threaded replies via the `parentCommentId` parameter. This section describes how to add threading to the form-based workflow.
+
+### Threading Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Comment Thread on Record                                    │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ 💬 john.doe - 10:32 AM                     [Thread: 0]  │ │
+│ │ "Can we review this campaign?"                          │ │
+│ │                                              [Reply]    │ │
+│ │                                                         │ │
+│ │   ┌─────────────────────────────────────────────────┐   │ │
+│ │   │ ↳ jane.smith - 11:15 AM            [Thread: 1]  │   │ │
+│ │   │   "Reviewed and approved!"                      │   │ │
+│ │   │                                        [Reply]  │   │ │
+│ │   └─────────────────────────────────────────────────┘   │ │
+│ │                                                         │ │
+│ │   ┌─────────────────────────────────────────────────┐   │ │
+│ │   │ ↳ john.doe - 2:22 PM               [Thread: 1]  │   │ │
+│ │   │   "Thanks, proceeding with launch."             │   │ │
+│ │   │                                        [Reply]  │   │ │
+│ │   └─────────────────────────────────────────────────┘   │ │
+│ └─────────────────────────────────────────────────────────┘ │
+│                                                             │
+│ [ Add New Comment ]                                         │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Schema Additions for Threading
+
+**Add to `Comment_Submissions` table:**
+
+| Field Name | Type | Purpose |
+|------------|------|---------|
+| `Parent_Comment` | Link to Comment_Log | References parent comment for replies |
+| `Is_Reply` | Formula | `IF({Parent_Comment}, TRUE(), FALSE())` |
+
+**Add to `Comment_Log` table:**
+
+| Field Name | Type | Purpose |
+|------------|------|---------|
+| `Parent_Comment_ID` | Text | Airtable API comment ID of parent |
+| `Parent_Log_Record` | Link to Comment_Log | Self-referential link to parent |
+| `Thread_Depth` | Number | 0 = top-level, 1 = reply, 2 = reply-to-reply |
+| `Thread_Root_ID` | Text | Original top-level comment ID for deep threads |
+| `Reply_Count` | Rollup | COUNT of linked replies (via Parent_Log_Record) |
+
+### Reply Form
+
+Create a separate form or interface for replying to existing comments:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│              Reply to Comment                           │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Original Comment:                                      │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │ "Can we review this campaign?" - @john.doe      │   │
+│  │ Posted: Dec 15, 2025 10:32 AM                   │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  Your Reply:                                            │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │                                                 │   │
+│  │                                                 │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│                              [ Submit Reply ]           │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Threaded Comment Submission Script
+
+**Automation Configuration:**
+- **Trigger:** When record is created in `Comment_Submissions`
+- **Action:** Run script (replaces or extends the basic script)
+
+```javascript
+/**
+ * Threaded Comment Submission Processor
+ *
+ * @version 1.1.0
+ * @release-date 2025-12-15
+ * @status Production Ready
+ * @deployment Airtable Automation Script
+ *
+ * TRIGGERS: When record created in Comment_Submissions
+ * ACTIONS:
+ *   1. Create comment via Airtable API (with optional parentCommentId)
+ *   2. Copy to Comment_Log with threading metadata
+ *   3. Update submission status
+ *
+ * INPUT VARIABLES REQUIRED:
+ *   - recordId: The trigger record ID
+ *   - apiToken: Airtable API token (Personal Access Token)
+ *   - baseId: Current base ID
+ */
+
+// === CONFIGURATION ===
+// CRITICAL: input.config() can only be called ONCE
+const config = input.config();
+const SUBMISSION_RECORD_ID = config.recordId;
+const API_TOKEN = config.apiToken;
+const BASE_ID = config.baseId;
+
+// Table IDs for comment targets - UPDATE THESE FOR YOUR BASE
+const TABLE_MAP = {
+    'Projects': 'tblXXXXXXXXXXXXXX',
+    'Campaigns': 'tblYYYYYYYYYYYYYY',
+    'Tasks': 'tblZZZZZZZZZZZZZZ'
+};
+
+// === MAIN EXECUTION ===
+async function main() {
+    const submissionsTable = base.getTable('Comment_Submissions');
+    const commentLogTable = base.getTable('Comment_Log');
+
+    // Get the submission record
+    const submission = await submissionsTable.selectRecordAsync(SUBMISSION_RECORD_ID);
+
+    if (!submission) {
+        console.error('Submission record not found');
+        return;
+    }
+
+    const targetRecordLinks = submission.getCellValue('Target_Record');
+    const targetTableName = submission.getCellValueAsString('Target_Table');
+    const commentText = submission.getCellValueAsString('Comment_Text');
+    const submittedBy = submission.getCellValue('Submitted_By');
+
+    // Threading fields
+    const parentCommentLinks = submission.getCellValue('Parent_Comment');
+    let parentCommentId = null;
+    let parentLogRecordId = null;
+    let threadDepth = 0;
+    let threadRootId = null;
+
+    // Validate inputs
+    if (!targetRecordLinks || targetRecordLinks.length === 0) {
+        await updateStatus(submissionsTable, SUBMISSION_RECORD_ID, 'Failed', 'No target record selected');
+        return;
+    }
+
+    if (!commentText || commentText.trim() === '') {
+        await updateStatus(submissionsTable, SUBMISSION_RECORD_ID, 'Failed', 'Comment text is empty');
+        return;
+    }
+
+    const targetRecordId = targetRecordLinks[0].id;
+    const targetTableId = TABLE_MAP[targetTableName];
+
+    if (!targetTableId) {
+        await updateStatus(submissionsTable, SUBMISSION_RECORD_ID, 'Failed', `Unknown table: ${targetTableName}`);
+        return;
+    }
+
+    // === Handle Threading ===
+    if (parentCommentLinks && parentCommentLinks.length > 0) {
+        parentLogRecordId = parentCommentLinks[0].id;
+
+        // Fetch parent comment details from Comment_Log
+        const parentLogRecord = await commentLogTable.selectRecordAsync(parentLogRecordId);
+
+        if (parentLogRecord) {
+            parentCommentId = parentLogRecord.getCellValueAsString('Comment_ID');
+            const parentDepth = parentLogRecord.getCellValue('Thread_Depth') || 0;
+            threadDepth = parentDepth + 1;
+
+            // Get thread root (either parent's root or parent itself if top-level)
+            threadRootId = parentLogRecord.getCellValueAsString('Thread_Root_ID')
+                || parentLogRecord.getCellValueAsString('Comment_ID');
+
+            console.log(`Creating reply to comment ${parentCommentId} at depth ${threadDepth}`);
+        }
+    }
+
+    try {
+        // === Step 1: Create comment via Airtable API ===
+        console.log(`Creating ${parentCommentId ? 'reply' : 'comment'} on ${targetTableName}/${targetRecordId}`);
+
+        const commentResult = await createAirtableComment(
+            BASE_ID,
+            targetTableId,
+            targetRecordId,
+            commentText,
+            API_TOKEN,
+            parentCommentId  // Pass parent for threading
+        );
+
+        console.log(`Comment created: ${commentResult.id}`);
+
+        // === Step 2: Copy to Comment_Log with threading metadata ===
+        const logRecordData = {
+            'Source_Record_ID': targetRecordId,
+            'Source_Table': { name: targetTableName },
+            'Comment_Text': commentText,
+            'Comment_ID': commentResult.id,
+            'Author_Name': submittedBy ? submittedBy[0].name : 'Unknown',
+            'Author_Email': submittedBy ? submittedBy[0].email : null,
+            'Created_At': new Date().toISOString(),
+            'Processing_Status': { name: 'Pending' },
+            'Submission_ID': SUBMISSION_RECORD_ID,
+            'Thread_Depth': threadDepth
+        };
+
+        // Add threading fields if this is a reply
+        if (parentCommentId) {
+            logRecordData['Parent_Comment_ID'] = parentCommentId;
+            logRecordData['Thread_Root_ID'] = threadRootId || commentResult.id;
+        } else {
+            // Top-level comment is its own thread root
+            logRecordData['Thread_Root_ID'] = commentResult.id;
+        }
+
+        // Add self-referential link if replying
+        if (parentLogRecordId) {
+            logRecordData['Parent_Log_Record'] = [{ id: parentLogRecordId }];
+        }
+
+        const logRecord = await commentLogTable.createRecordAsync(logRecordData);
+        console.log(`Logged to Comment_Log: ${logRecord}`);
+
+        // === Step 3: Update submission status ===
+        await updateStatus(
+            submissionsTable,
+            SUBMISSION_RECORD_ID,
+            'Posted',
+            JSON.stringify(commentResult, null, 2),
+            commentResult.id
+        );
+
+        console.log('Comment submission processed successfully');
+
+    } catch (error) {
+        console.error(`Error processing comment: ${error.message}`);
+        await updateStatus(
+            submissionsTable,
+            SUBMISSION_RECORD_ID,
+            'Failed',
+            error.message
+        );
+    }
+}
+
+// === HELPER FUNCTIONS ===
+
+async function createAirtableComment(baseId, tableId, recordId, text, apiToken, parentCommentId = null) {
+    const url = `https://api.airtable.com/v0/${baseId}/${tableId}/${recordId}/comments`;
+
+    const body = { text };
+
+    // Add parentCommentId for threaded replies
+    if (parentCommentId) {
+        body.parentCommentId = parentCommentId;
+    }
+
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${apiToken}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`API Error ${response.status}: ${JSON.stringify(errorData)}`);
+    }
+
+    return await response.json();
+}
+
+async function updateStatus(table, recordId, status, apiResponse = null, commentId = null) {
+    const updates = {
+        'Status': { name: status }
+    };
+
+    if (apiResponse) {
+        updates['API_Response'] = apiResponse;
+    }
+
+    if (commentId) {
+        updates['Airtable_Comment_ID'] = commentId;
+    }
+
+    await table.updateRecordAsync(recordId, updates);
+}
+
+// Execute
+await main();
+```
+
+### Interface Button - Reply to Comment
+
+Add a "Reply" button to each comment in your Interface:
+
+```javascript
+/**
+ * Interface Button Script - Reply to Comment
+ *
+ * @version 1.1.0
+ * @release-date 2025-12-15
+ * @status Production Ready
+ * @deployment Airtable Interface Button Script
+ *
+ * PLACEMENT: Comment_Log record list or detail view
+ *
+ * INPUT VARIABLES REQUIRED:
+ *   - commentLogRecordId: The Comment_Log record being replied to
+ *   - baseId: Current base ID
+ *   - apiToken: Airtable API token
+ *   - currentUserId: Current user's collaborator ID
+ */
+
+// CRITICAL: input.config() can only be called ONCE
+const config = input.config();
+const PARENT_LOG_RECORD_ID = config.commentLogRecordId;
+const BASE_ID = config.baseId;
+const API_TOKEN = config.apiToken;
+
+const commentLogTable = base.getTable('Comment_Log');
+
+// Get parent comment details
+const parentRecord = await commentLogTable.selectRecordAsync(PARENT_LOG_RECORD_ID);
+
+if (!parentRecord) {
+    output.markdown('❌ **Parent comment not found**');
+    return;
+}
+
+const parentCommentId = parentRecord.getCellValueAsString('Comment_ID');
+const sourceRecordId = parentRecord.getCellValueAsString('Source_Record_ID');
+const sourceTable = parentRecord.getCellValueAsString('Source_Table');
+const parentText = parentRecord.getCellValueAsString('Comment_Text');
+const parentAuthor = parentRecord.getCellValueAsString('Author_Name');
+const parentDepth = parentRecord.getCellValue('Thread_Depth') || 0;
+const threadRootId = parentRecord.getCellValueAsString('Thread_Root_ID') || parentCommentId;
+
+// Show parent comment context
+output.markdown(`**Replying to ${parentAuthor}:**\n> ${parentText.substring(0, 200)}${parentText.length > 200 ? '...' : ''}`);
+
+// Prompt for reply text
+const replyText = await input.textAsync('Enter your reply:');
+
+if (!replyText || replyText.trim() === '') {
+    output.markdown('⚠️ **No reply entered**');
+    return;
+}
+
+// Get current user info
+const currentUser = base.activeCollaborators.find(
+    c => c.id === config.currentUserId
+);
+
+// Table ID mapping - UPDATE FOR YOUR BASE
+const TABLE_MAP = {
+    'Projects': 'tblXXXXXXXXXXXXXX',
+    'Campaigns': 'tblYYYYYYYYYYYYYY',
+    'Tasks': 'tblZZZZZZZZZZZZZZ'
+};
+
+const tableId = TABLE_MAP[sourceTable];
+
+if (!tableId) {
+    output.markdown(`❌ **Unknown table: ${sourceTable}**`);
+    return;
+}
+
+try {
+    // Create threaded reply via API
+    const response = await fetch(
+        `https://api.airtable.com/v0/${BASE_ID}/${tableId}/${sourceRecordId}/comments`,
+        {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${API_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                text: replyText,
+                parentCommentId: parentCommentId  // Creates threaded reply
+            })
+        }
+    );
+
+    const result = await response.json();
+
+    if (response.ok) {
+        // Log reply to Comment_Log with threading metadata
+        await commentLogTable.createRecordAsync({
+            'Source_Record_ID': sourceRecordId,
+            'Source_Table': { name: sourceTable },
+            'Comment_Text': replyText,
+            'Comment_ID': result.id,
+            'Author_Name': currentUser?.name || 'Unknown',
+            'Author_Email': currentUser?.email || null,
+            'Created_At': new Date().toISOString(),
+            'Processing_Status': { name: 'Pending' },
+            'Parent_Comment_ID': parentCommentId,
+            'Parent_Log_Record': [{ id: PARENT_LOG_RECORD_ID }],
+            'Thread_Depth': parentDepth + 1,
+            'Thread_Root_ID': threadRootId
+        });
+
+        output.markdown(`✅ **Reply posted successfully!**\n\n> ${replyText}`);
+    } else {
+        output.markdown(`❌ **Failed to post reply**\n\n\`${JSON.stringify(result)}\``);
+    }
+
+} catch (error) {
+    output.markdown(`❌ **Error:** ${error.message}`);
+}
+```
+
+### Thread View Configuration
+
+Create an Interface view to display threaded conversations:
+
+**View Settings for Comment_Log:**
+
+1. **Filter:** `Source_Record_ID = {current record ID}`
+2. **Sort:** `Created_At` ascending
+3. **Group by:** `Thread_Root_ID` (groups all replies under their parent)
+
+**Display Formula for Indentation:**
+
+Add a formula field `Thread_Display_Prefix`:
+
+```
+REPT("    ↳ ", {Thread_Depth})
+```
+
+**Display Formula for Full Thread Display:**
+
+```
+IF(
+    {Thread_Depth} > 0,
+    CONCATENATE(REPT("  ", {Thread_Depth}), "↳ ", {Author_Name}, ": ", {Comment_Text}),
+    CONCATENATE("💬 ", {Author_Name}, ": ", {Comment_Text})
+)
+```
+
+### Threading Limitations
+
+| Aspect | Native Airtable | This Pattern |
+|--------|-----------------|--------------|
+| Max thread depth | Unlimited | Unlimited (but UI gets unwieldy past 3-4) |
+| API support | ✅ `parentCommentId` | ✅ Uses native API |
+| Displays in native UI | ✅ Yes | ✅ Yes |
+| Displays in Comment_Log | N/A | ✅ Yes (with Thread_Depth) |
+| Reply notifications | ✅ Automatic | ⚠️ Requires additional automation |
 
 ---
 
@@ -610,6 +1074,25 @@ If using OAuth authentication instead of Personal Access Tokens:
 
 ---
 
-*Document Version: 1.0.0*
+*Document Version: 1.1.0*
 *Last Updated: 2025-12-15*
 *Pattern Status: Production Ready*
+
+---
+
+## Changelog
+
+### v1.1.0 (2025-12-15)
+- Added Threading Support section with complete implementation
+- Added schema additions for threading (Parent_Comment_ID, Thread_Depth, Thread_Root_ID)
+- Added Threaded Comment Submission Script with parentCommentId support
+- Added Interface Button Script for Reply to Comment
+- Added Thread View Configuration with display formulas
+- Updated comparison table to reflect threading capability
+- Why: Enable full threaded conversation support using native Airtable API
+
+### v1.0.0 (2025-12-15)
+- Initial release with basic comment submission workflow
+- Comment_Submissions and Comment_Log table schemas
+- Automation scripts for processing and webhook integration
+- Interface button for inline commenting
